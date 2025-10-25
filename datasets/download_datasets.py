@@ -1,4 +1,3 @@
-# download_datasets.py
 """
 Dataset Download/Organize Utility for Indian Speech Validation.
 
@@ -34,6 +33,21 @@ from typing import Dict, List, Optional
 import requests
 from tqdm import tqdm
 
+# Load .env file if available
+try:
+    from dotenv import load_dotenv, find_dotenv
+    # Try to find .env file automatically
+    dotenv_path = find_dotenv()
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=True)
+        _DOTENV_AVAILABLE = True
+    else:
+        # Try loading from current directory anyway
+        load_dotenv(override=True)
+        _DOTENV_AVAILABLE = True
+except Exception as e:
+    _DOTENV_AVAILABLE = False
+
 # Optional deps
 try:
     from datasets import load_dataset
@@ -50,9 +64,14 @@ except Exception:
 
 class DatasetDownloader:
     def __init__(self, output_dir: str = "./datasets", verbose: bool = True):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.verbose = verbose
+        try:
+            self.output_dir = Path(output_dir).resolve()
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"❌ Error creating output directory '{output_dir}': {e}")
+            print(f"   Make sure you have write permissions in this location.")
+            raise
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (ASR-Downloader)"})
 
@@ -73,7 +92,7 @@ class DatasetDownloader:
                 with open(dest, "wb") as f, tqdm(
                     total=total, unit="iB", unit_scale=True, desc=desc
                 ) as bar:
-                    for chunk in r.itercontent(chunk_size=1024 * 256):
+                    for chunk in r.iter_content(chunk_size=1024 * 256):  # FIXED: was itercontent
                         if chunk:
                             f.write(chunk)
                             bar.update(len(chunk))
@@ -99,27 +118,102 @@ class DatasetDownloader:
     def fetch_common_voice(self, languages: List[str], split: List[str]) -> None:
         """
         Pulls Common Voice (latest) via HuggingFace datasets.
-        NOTE: Requires `datasets` package and internet.
+        NOTE: Requires `datasets` package, internet, and HuggingFace authentication.
         """
         if not _HF_AVAILABLE:
             self.log("⚠️  'datasets' not installed. pip install datasets")
             return
+        
+        # Check for HF token (try multiple variable names)
+        import os
+        hf_token = (
+            os.environ.get("HF_TOKEN") or 
+            os.environ.get("HUGGING_FACE_HUB_TOKEN") or
+            os.environ.get("HUGGINGFACE_TOKEN")
+        )
+        
+        if not hf_token:
+            # Try loading .env one more time explicitly
+            if _DOTENV_AVAILABLE:
+                from dotenv import load_dotenv
+                from pathlib import Path
+                env_file = Path(".env")
+                if env_file.exists():
+                    self.log(f"Found .env file at: {env_file.absolute()}")
+                    load_dotenv(env_file, override=True)
+                    hf_token = (
+                        os.environ.get("HF_TOKEN") or 
+                        os.environ.get("HUGGING_FACE_HUB_TOKEN") or
+                        os.environ.get("HUGGINGFACE_TOKEN")
+                    )
+                    if hf_token:
+                        self.log("✓ Successfully loaded token from .env file")
+        
+        if not hf_token:
+            self.log("=" * 60)
+            self.log("⚠️  WARNING: No HuggingFace token found!")
+            self.log("=" * 60)
+            self.log("   Common Voice requires authentication. Please:")
+            self.log("   1. Create account at https://huggingface.co")
+            self.log("   2. Accept Common Voice terms at https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0")
+            self.log("   3. Get token from https://huggingface.co/settings/tokens")
+            self.log("")
+            self.log("   Then add token using ONE of these methods:")
+            self.log("   ")
+            self.log("   METHOD 1: .env file (recommended)")
+            self.log("     Create a file named '.env' with:")
+            self.log("     HF_TOKEN=hf_your_token_here")
+            if not _DOTENV_AVAILABLE:
+                self.log("     📦 First install: pip install python-dotenv")
+            self.log("   ")
+            self.log("   METHOD 2: Environment variable")
+            self.log("     export HF_TOKEN=hf_your_token_here")
+            self.log("   ")
+            self.log("   METHOD 3: HuggingFace CLI")
+            self.log("     huggingface-cli login")
+            self.log("")
+            self.log("   💡 Run check_token.py to diagnose token issues")
+            self.log("=" * 60)
+            self.log("")
+        else:
+            token_preview = hf_token[:10] + "..." if len(hf_token) > 10 else hf_token
+            self.log(f"✓ HuggingFace token found: {token_preview}")
+        
         for lang in languages:
             for sp in split:
                 self.log(f"Fetching Common Voice: lang={lang}, split={sp}")
-                try:
-                    ds = load_dataset("mozilla-foundation/common_voice_17_0", lang, split=sp)
-                except Exception:
-                    # fallback to 16 or 15 by trying a small list
-                    for ver in ["16_1", "16_0", "15_0"]:
-                        try:
-                            ds = load_dataset(f"mozilla-foundation/common_voice_{ver}", lang, split=sp)
-                            break
-                        except Exception:
-                            ds = None
-                    if ds is None:
-                        self.log(f"❌ Could not load Common Voice for {lang}/{sp}")
+                ds = None
+                
+                # Try multiple versions with proper error messages
+                versions_to_try = [
+                    ("mozilla-foundation/common_voice_17_0", "17.0"),
+                    ("mozilla-foundation/common_voice_16_1", "16.1"),
+                    ("mozilla-foundation/common_voice_16_0", "16.0"),
+                    ("mozilla-foundation/common_voice_15_0", "15.0"),
+                ]
+                
+                for repo, ver_name in versions_to_try:
+                    try:
+                        ds = load_dataset(repo, lang, split=sp, token=hf_token)
+                        self.log(f"✓ Loaded Common Voice {ver_name}")
+                        break
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if "authentication" in error_msg or "401" in error_msg or "403" in error_msg:
+                            self.log(f"⚠️  Authentication required for Common Voice {ver_name}")
+                            if ver_name == "17.0":  # Only show detailed help once
+                                self.log("   Please authenticate with HuggingFace (see instructions above)")
+                            break  # Don't try other versions if auth fails
+                        elif "not found" in error_msg or "404" in error_msg:
+                            self.log(f"⚠️  Language '{lang}' not available in Common Voice {ver_name}")
+                        else:
+                            self.log(f"⚠️  Failed to load {ver_name}: {e}")
                         continue
+                    
+                if ds is None:
+                    self.log(f"❌ Could not load Common Voice for {lang}/{sp}")
+                    self.log(f"   Try alternative datasets or check language code (should be like 'hi', 'en', 'ta', etc.)")
+                    continue
 
                 # Save a simple manifest (paths and text)
                 out_dir = self.output_dir / "common_voice" / lang / sp
@@ -183,10 +277,21 @@ class DatasetDownloader:
             self.log("⚠️  'datasets' not installed. pip install datasets")
             return
 
+        # Get HF token if available (try multiple variable names)
+        import os
+        hf_token = (
+            os.environ.get("HF_TOKEN") or 
+            os.environ.get("HUGGING_FACE_HUB_TOKEN") or
+            os.environ.get("HUGGINGFACE_TOKEN")
+        )
+
         out_name = out_name or repo_id.replace("/", "__")
         for sp in split:
             try:
-                ds = load_dataset(repo_id, subset, split=sp) if subset else load_dataset(repo_id, split=sp)
+                if subset:
+                    ds = load_dataset(repo_id, subset, split=sp, token=hf_token)
+                else:
+                    ds = load_dataset(repo_id, split=sp, token=hf_token)
             except Exception as e:
                 self.log(f"❌ HF load failed: {repo_id} ({subset}) {sp} -> {e}")
                 continue
